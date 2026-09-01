@@ -30,14 +30,23 @@ def _moving_average(x: np.ndarray, w: int) -> np.ndarray:
 
 
 def _median_filter(x: np.ndarray, w: int) -> np.ndarray:
+    """Sliding median, vectorised over the window axis.
+
+    The obvious `for i in range(len(x)): np.median(xp[i:i+w])` costs one Python
+    call per *frame per class per clip*. Validating 8k clips over 8 classes for
+    two models is ~30M of those, which dominated the epoch - and the tuner then
+    pays it again on every parameter trial. `sliding_window_view` is a view, so
+    this allocates one (n, w) stride trick and takes a single median.
+
+    Row count is `n + 2*pad - w + 1`, which is exactly n for odd w and n+1 for
+    even w, so the trailing slice restores the original length in both cases.
+    """
     if w <= 1:
         return x
     pad = w // 2
     xp = np.pad(x, (pad, pad), mode="edge")
-    out = np.empty_like(x)
-    for i in range(len(x)):
-        out[i] = np.median(xp[i:i + w])
-    return out
+    sw = np.lib.stride_tricks.sliding_window_view(xp, w)
+    return np.median(sw, axis=-1)[:len(x)]
 
 
 def change_curve(scores: np.ndarray, step_len: int) -> np.ndarray:

@@ -34,8 +34,9 @@ train:
   grad_clip: 5.0
   ema_decay: 0.999            # mean-teacher decay
   amp: true
-  num_workers: 4
+  num_workers: 2              # clamped to os.cpu_count() at runtime
   prefetch_factor: 4
+  log_every: 50               # steps between progress lines (0 = silent epochs)
   eval_every: 1
   # Every batch carries all three tiers so consistency and per-tier MixStyle
   # always have something to work with.

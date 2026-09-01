@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -166,7 +167,10 @@ def main() -> None:
 
     bs = int(cfg["train"]["batch_size"])
     sampler = TierBatchSampler(tr_recs, bs, cfg["train"]["tier_quotas"], seed=cfg.get("seed", 42))
-    nw = int(cfg["train"].get("num_workers", 4))
+    # Clamp to the real core count. A Colab T4 runtime has 2 vCPUs, and asking
+    # for more workers than that oversubscribes them against the main process
+    # feeding the GPU - it makes the epoch slower, not faster.
+    nw = min(int(cfg["train"].get("num_workers", 2)), os.cpu_count() or 1)
     dl_kw = dict(collate_fn=collate, num_workers=nw, pin_memory=True,
                  persistent_workers=nw > 0)
     if nw > 0:
@@ -255,6 +259,10 @@ def main() -> None:
     nonfinite_run = torch.zeros((), device=device)
     check_every = int(cfg["train"].get("nonfinite_check_every", 50))
 
+    log_every = int(cfg["train"].get("log_every", 50))
+    print("[train] %d steps/epoch, %d epochs -> %d steps total"
+          % (steps_per_epoch, epochs, total_steps))
+
     for ep in range(1, epochs + 1):
         student.train()
         t0, agg, nb = time.time(), {}, 0
@@ -311,6 +319,16 @@ def main() -> None:
             # Accumulated on-device; read back once, below, after the epoch.
             for k, v in logs.items():
                 agg[k] = agg.get(k, 0.0) + v
+
+            # A heartbeat. An epoch here is thousands of steps and the summary
+            # line only lands after validation, so without this a healthy run is
+            # indistinguishable from a hung one for tens of minutes. Reading the
+            # loss syncs, hence once every `log_every` steps rather than always.
+            if log_every and nb % log_every == 0:
+                el = time.time() - t0
+                print("[ep %d/%d] step %d/%d  loss=%.4f  %.2fs/step  eta %.1fm"
+                      % (ep, epochs, nb, steps_per_epoch, float(logs["loss"]),
+                         el / nb, (steps_per_epoch - nb) * el / nb / 60), flush=True)
 
         agg = {k: (float(v) / max(1, nb)) for k, v in agg.items()}
         msg = " ".join("%s=%.4f" % (k, v) for k, v in sorted(agg.items()))

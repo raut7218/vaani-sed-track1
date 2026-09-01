@@ -2,7 +2,8 @@
 import pathlib, sys, numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from src.postproc.csebbs import csebbs_single, median_filter_decode, union_events, default_params_for
+from src.postproc.csebbs import (csebbs_single, median_filter_decode, union_events,
+                                 default_params_for, _median_filter)
 from src.evaluation.metrics import evaluate, clip_dice, match_events
 from src.postproc.tune import tune
 
@@ -42,6 +43,23 @@ ok(r["event_f1"] == 0.0 and r["recall"] == 0.0, "empty pred = 0 recall")
 # clips predicted but absent from the reference are pure false positives
 r = evaluate({"a": [(0.0,1.0)], "ghost": [(0.0,1.0)]}, {"a": [(0.0,1.0)]})
 ok(r["fp"] == 1 and r["event_f1"] < 1.0, "extra clip costs precision")
+
+# ---------- median filter: vectorised form must equal the naive loop ----------
+def _median_ref(x, w):
+    if w <= 1:
+        return x
+    pad = w // 2
+    xp = np.pad(x, (pad, pad), mode="edge")
+    return np.array([np.median(xp[i:i + w]) for i in range(len(x))])
+
+_mf_rng = np.random.RandomState(3)
+_mf_bad = 0
+for _n in (1, 2, 7, 50, 251):
+    _x = _mf_rng.rand(_n)
+    for _w in range(1, 12):
+        if not np.allclose(_median_filter(_x, _w), _median_ref(_x, _w)):
+            _mf_bad += 1
+ok(_mf_bad == 0, "vectorised median filter matches the naive loop (odd and even w)")
 
 # ---------- csebbs decoding ----------
 def curve(spans, n=250, hi=0.95, lo=0.05, noise=0.0, seed=0):
