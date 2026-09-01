@@ -74,6 +74,32 @@ def write_cfg() -> Path:
     return p
 
 
+def check_submission(zip_path: Path, n_clips: int) -> None:
+    """Validate the archive against the competition's stated format."""
+    import zipfile
+    with zipfile.ZipFile(zip_path) as z:
+        names = z.namelist()
+        assert names == ["predictions.jsonl"], \
+            "archive must hold exactly predictions.jsonl at its root, got %s" % names
+        lines = z.read("predictions.jsonl").decode("utf-8").strip().split("\n")
+
+    assert len(lines) == n_clips, "expected %d lines, got %d" % (n_clips, len(lines))
+    seen, n_ev = set(), 0
+    for line in lines:
+        rec = json.loads(line)
+        assert set(rec) == {"clip_id", "events"}, "bad record keys: %s" % sorted(rec)
+        assert isinstance(rec["clip_id"], str) and rec["clip_id"]
+        assert rec["clip_id"] not in seen, "duplicate clip_id %s" % rec["clip_id"]
+        seen.add(rec["clip_id"])
+        assert isinstance(rec["events"], list)
+        for ev in rec["events"]:
+            assert set(ev) == {"onset", "offset"}, "bad event keys: %s" % sorted(ev)
+            assert isinstance(ev["onset"], float) and isinstance(ev["offset"], float)
+            assert 0.0 <= ev["onset"] <= ev["offset"], "bad span %s" % ev
+        n_ev += len(rec["events"])
+    print("\n[smoke] PASS - %d clips, %d events, submission format valid" % (len(seen), n_ev))
+
+
 def run(cmd: list[str]) -> None:
     print("\n$ " + " ".join(cmd))
     r = subprocess.run(cmd, cwd=str(ROOT))
@@ -94,15 +120,9 @@ def main() -> None:
          "--ckpt", str(TMP / "run" / "best.pt"),
          "--manifest", str(TMP / "data" / "manifest.jsonl"),
          "--params", str(TMP / "run" / "postproc_params.json"),
-         "--out", str(TMP / "submission.json")])
+         "--out", str(TMP / "submission.zip")])
 
-    sub = json.loads((TMP / "submission.json").read_text(encoding="utf-8"))
-    n_ev = sum(len(v) for v in sub.values())
-    assert len(sub) == 72, "expected 72 clips, got %d" % len(sub)
-    sample = next(iter(sub.values()))
-    if sample:
-        assert set(sample[0]) == {"onset", "offset"}, "bad submission schema"
-    print("\n[smoke] PASS - %d clips, %d events" % (len(sub), n_ev))
+    check_submission(TMP / "submission.zip", n_clips=72)
     print("[smoke] artefacts in %s" % TMP)
 
 

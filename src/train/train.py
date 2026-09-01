@@ -32,22 +32,49 @@ def load_cfg(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-@torch.no_grad()
-def update_ema(student: torch.nn.Module, teacher: torch.nn.Module, decay: float) -> None:
-    """EMA over trainable params only - the frozen BEATs module is shared between
-    student and teacher, so averaging it would be pure wasted bandwidth."""
+def build_ema_pairs(student: torch.nn.Module, teacher: torch.nn.Module):
+    """Pair up the tensors the EMA has to touch, once, at startup.
+
+    Resolving names through `named_parameters` on every step meant rebuilding two
+    dicts and issuing two kernel launches per tensor - a few hundred launches per
+    step, which a Colab host CPU cannot feed fast enough to keep the GPU busy.
+    Pairing here lets the update run as two fused `_foreach` calls instead.
+
+    Only trainable tensors are paired. The frozen BEATs module is *the same
+    object* in both models, so its parameters and buffers are filtered out by
+    identity - averaging a tensor onto itself is pure wasted bandwidth.
+    """
     sp = dict(student.named_parameters())
+    s_par, t_par = [], []
     for name, tp in teacher.named_parameters():
-        if not tp.requires_grad and "beats.beats" in name:
-            continue
         p = sp.get(name)
-        if p is None:
+        if p is None or not p.requires_grad or p is tp:
             continue
-        tp.mul_(decay).add_(p.detach(), alpha=1.0 - decay)
+        s_par.append(p)
+        t_par.append(tp)
+
     sb = dict(student.named_buffers())
+    s_buf, t_buf = [], []
     for name, tb in teacher.named_buffers():
         b = sb.get(name)
-        if b is not None and tb.dtype == b.dtype:
+        if b is None or b is tb or tb.dtype != b.dtype or tb.shape != b.shape:
+            continue
+        s_buf.append(b)
+        t_buf.append(tb)
+    return s_par, t_par, s_buf, t_buf
+
+
+@torch.no_grad()
+def update_ema(pairs, decay: float) -> None:
+    """teacher = decay * teacher + (1 - decay) * student, plus buffer sync."""
+    s_par, t_par, s_buf, t_buf = pairs
+    if t_par:
+        torch._foreach_mul_(t_par, decay)
+        torch._foreach_add_(t_par, s_par, alpha=1.0 - decay)
+    # BatchNorm running stats are copied, not averaged: they are already an EMA
+    # of the student's batch statistics.
+    if t_buf:
+        for tb, b in zip(t_buf, s_buf):
             tb.copy_(b)
 
 
@@ -113,6 +140,10 @@ def main() -> None:
     torch.manual_seed(cfg.get("seed", 42))
     np.random.seed(cfg.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Every training step sees the identical tensor shape (the window is fixed),
+    # so cuDNN's autotuner pays for itself in the first few steps and then hands
+    # back the fastest algorithm for this conv stack for the rest of the run.
+    torch.backends.cudnn.benchmark = True
     out_dir = Path(cfg["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     print("[train] device=%s" % device)
@@ -135,11 +166,16 @@ def main() -> None:
 
     bs = int(cfg["train"]["batch_size"])
     sampler = TierBatchSampler(tr_recs, bs, cfg["train"]["tier_quotas"], seed=cfg.get("seed", 42))
-    nw = int(cfg["train"].get("num_workers", 2))
-    dl_tr = DataLoader(ds_tr, batch_sampler=sampler, collate_fn=collate, num_workers=nw,
-                       pin_memory=True, persistent_workers=nw > 0)
-    dl_va = DataLoader(ds_va, batch_size=bs, shuffle=False, collate_fn=collate,
-                       num_workers=nw, pin_memory=True) if va_recs else None
+    nw = int(cfg["train"].get("num_workers", 4))
+    dl_kw = dict(collate_fn=collate, num_workers=nw, pin_memory=True,
+                 persistent_workers=nw > 0)
+    if nw > 0:
+        dl_kw["prefetch_factor"] = int(cfg["train"].get("prefetch_factor", 4))
+    dl_tr = DataLoader(ds_tr, batch_sampler=sampler, **dl_kw)
+    # The val loader keeps its workers alive too - it is re-entered every epoch,
+    # and respawning them each time costs more than the evaluation itself on a
+    # small validation split.
+    dl_va = DataLoader(ds_va, batch_size=bs, shuffle=False, **dl_kw) if va_recs else None
 
     beats = None
     if cfg["model"].get("use_beats", True):
@@ -165,12 +201,20 @@ def main() -> None:
     teacher.load_state_dict(student.state_dict())
     for p in teacher.parameters():
         p.requires_grad_(False)
+    # The teacher is only ever run to produce a stable target, which means always
+    # in eval mode. Pinning it here removes a train()/eval() round trip - each of
+    # which walks every submodule, BEATs' 12 transformer layers included - from
+    # every single step.
+    teacher.eval()
+    ema_pairs = build_ema_pairs(student, teacher)
 
-    n_train = sum(p.numel() for p in student.parameters() if p.requires_grad)
-    print("[train] trainable params: %.2fM" % (n_train / 1e6))
+    # Materialised once: rebuilding this list inside the step just to clip
+    # gradients walks every parameter of a 90M-parameter model every iteration.
+    trainable = [p for p in student.parameters() if p.requires_grad]
+    print("[train] trainable params: %.2fM" % (sum(p.numel() for p in trainable) / 1e6))
 
     opt = torch.optim.AdamW(
-        [p for p in student.parameters() if p.requires_grad],
+        trainable,
         lr=float(cfg["train"]["lr"]), weight_decay=float(cfg["train"]["weight_decay"]))
 
     epochs = int(cfg["train"]["epochs"])
@@ -204,50 +248,56 @@ def main() -> None:
     best = -1.0
     history = []
     gstep = 0
-    n_nonfinite = 0
-    nonfinite_limit = int(cfg['train'].get('nonfinite_limit', 50))
+    nonfinite_limit = int(cfg["train"].get("nonfinite_limit", 50))
+    # Consecutive-non-finite counter kept *on the device*. Reading it every step
+    # would reintroduce the synchronisation this loop is built to avoid, so it is
+    # maintained with device-side arithmetic and only read back periodically.
+    nonfinite_run = torch.zeros((), device=device)
+    check_every = int(cfg["train"].get("nonfinite_check_every", 50))
 
     for ep in range(1, epochs + 1):
         student.train()
-        teacher.train()
         t0, agg, nb = time.time(), {}, 0
         for batch in dl_tr:
             batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
                      for k, v in batch.items()}
             with torch.autocast("cuda", enabled=amp):
+                # One frozen-encoder pass for both branches. Student and teacher
+                # see the identical waveform and share the identical frozen BEATs
+                # module, so a second pass would recompute the same tensor for
+                # roughly a third of the step's wall clock.
+                beats_feat = student.encode_beats(batch["wav"])
                 s_out = student(batch["wav"], tier=batch["tier"],
-                                frame_valid=batch["frame_valid"])
+                                frame_valid=batch["frame_valid"],
+                                beats_feat=beats_feat)
                 t_out = None
                 if loss_cfg.get("lambda_cons", 0) > 0:
                     # Teacher sees the same audio without MixStyle/SpecAugment:
                     # a stable target is the whole point of the EMA branch.
-                    teacher.eval()
                     with torch.no_grad():
                         t_out = teacher(batch["wav"], tier=None,
-                                        frame_valid=batch["frame_valid"])
-                    teacher.train()
+                                        frame_valid=batch["frame_valid"],
+                                        beats_feat=beats_feat)
                 loss, logs = compute_total_loss(s_out, t_out, batch, loss_cfg, gstep)
 
             # Fail fast on a persistently non-finite loss. GradScaler silently
             # skips such steps, so without this the run burns every epoch
-            # updating nothing and reports NaN the whole way down.
-            if not torch.isfinite(loss):
-                n_nonfinite += 1
-                if n_nonfinite >= nonfinite_limit:
-                    raise RuntimeError(
-                        "loss has been non-finite for %d consecutive steps.\n"
-                        "Most likely a mixed-precision issue: rerun with --no-amp "
-                        "(or train.amp: false) to confirm.\n"
-                        "Last components: %s" % (n_nonfinite, logs))
-            else:
-                n_nonfinite = 0
+            # updating nothing and reports NaN the whole way down. The counter
+            # multiplies by `bad`, so any finite step resets it to zero.
+            bad = (~torch.isfinite(loss)).to(nonfinite_run.dtype)
+            nonfinite_run = (nonfinite_run + bad) * bad
+            if gstep % check_every == 0 and float(nonfinite_run) >= nonfinite_limit:
+                raise RuntimeError(
+                    "loss has been non-finite for %d consecutive steps.\n"
+                    "Most likely a mixed-precision issue: rerun with --no-amp "
+                    "(or train.amp: false) to confirm."
+                    % int(nonfinite_run))
 
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(
-                [p for p in student.parameters() if p.requires_grad],
-                float(cfg["train"].get("grad_clip", 5.0)))
+                trainable, float(cfg["train"].get("grad_clip", 5.0)))
             scaler.step(opt)
             scaler.update()
             sched.step()
@@ -255,13 +305,15 @@ def main() -> None:
             # steps to forget its random init, so on shorter runs it stays near
             # noise and its predictions are meaningless. This is the standard
             # mean-teacher warmup and is a no-op once the run is long enough.
-            update_ema(student, teacher, min(1.0 - 1.0 / (gstep + 1), ema_decay))
+            update_ema(ema_pairs, min(1.0 - 1.0 / (gstep + 1), ema_decay))
             gstep += 1
             nb += 1
+            # Accumulated on-device; read back once, below, after the epoch.
             for k, v in logs.items():
                 agg[k] = agg.get(k, 0.0) + v
 
-        msg = " ".join("%s=%.4f" % (k, v / max(1, nb)) for k, v in sorted(agg.items()))
+        agg = {k: (float(v) / max(1, nb)) for k, v in agg.items()}
+        msg = " ".join("%s=%.4f" % (k, v) for k, v in sorted(agg.items()))
         line = "[ep %d/%d] %s lr=%.2e %.0fs" % (
             ep, epochs, msg, sched.get_last_lr()[0], time.time() - t0)
 
@@ -271,7 +323,7 @@ def main() -> None:
                 preds = {u: union_events(
                     decode_clip(sc[u], le.classes, fps, params_pp, n_valid_frames=vl[u]))
                     for u in sc}
-                res = evaluate(preds, va_refs, collar_mode=cfg["eval"]["collar_mode"])
+                res = evaluate(preds, va_refs)
                 line += "  %s: F1=%.4f dice=%.4f score=%.4f" % (
                     name, res["event_f1"], res["segment_dice"], res["score"])
                 if res["score"] > best:
@@ -279,8 +331,9 @@ def main() -> None:
                     torch.save({"model": m.state_dict(), "cfg": cfg,
                                 "classes": le.classes, "which": name, "epoch": ep,
                                 "score": best}, out_dir / "best.pt")
-                    np.savez_compressed(out_dir / "val_scores.npz",
-                                        **{u: sc[u] for u in sc})
+                    # Uncompressed: these are ~10 MB of float32 and zlib on a
+                    # 2-vCPU Colab host costs more than the evaluation did.
+                    np.savez(out_dir / "val_scores.npz", **{u: sc[u] for u in sc})
                     (out_dir / "val_meta.json").write_text(json.dumps(
                         {"valid": vl, "refs": {u: va_refs[u] for u in sc},
                          "classes": le.classes, "fps": fps}), encoding="utf-8")

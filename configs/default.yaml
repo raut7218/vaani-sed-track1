@@ -34,7 +34,8 @@ train:
   grad_clip: 5.0
   ema_decay: 0.999            # mean-teacher decay
   amp: true
-  num_workers: 2
+  num_workers: 4
+  prefetch_factor: 4
   eval_every: 1
   # Every batch carries all three tiers so consistency and per-tier MixStyle
   # always have something to work with.
@@ -63,6 +64,3 @@ postproc:
   method: csebbs              # csebbs | median
   union_gap: 0.05
   params_file: ""             # written by scripts/tune_postproc.py
-
-eval:
-  collar_mode: pct            # pct = strict 20% of duration | sed_eval = max(0.2s, 20%)

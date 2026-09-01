@@ -118,11 +118,6 @@ def resolve_event_class(category: str, tag: str, expand_vehicle: bool) -> str | 
     return base
 
 
-def to_base(cls: str) -> str:
-    """Collapse an expanded class back to its top-level category."""
-    return "vehicle_traffic" if cls in VEHICLE_SPLIT else cls
-
-
 class LabelEncoder:
     def __init__(self, expand_vehicle: bool = True):
         self.expand_vehicle = expand_vehicle

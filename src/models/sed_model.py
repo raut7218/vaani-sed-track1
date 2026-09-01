@@ -113,20 +113,38 @@ class VaaniSEDModel(nn.Module):
         self.head_drop = nn.Dropout(dropout)
         self.head = AttentionPool(rnn_dim * 2, n_class)
 
+    @torch.no_grad()
+    def encode_beats(self, wav: torch.Tensor) -> torch.Tensor | None:
+        """Raw frozen-encoder features, (B, Tb, 768). None when BEATs is off.
+
+        Split out of `forward` so the training loop can compute this *once* and
+        hand the same tensor to both the student and the EMA teacher. The encoder
+        is frozen and both branches see the identical waveform, so computing it
+        twice was producing two bit-identical tensors for double the cost - and
+        BEATs is the single most expensive component in the step.
+        """
+        if self.beats is None:
+            return None
+        b = self.beats(wav)                        # (B, Tb, 768)
+        # Frozen encoder: a non-finite value here can only poison the trainable
+        # branch, so neutralise it rather than propagate it.
+        return torch.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0)
+
     def forward(self, wav: torch.Tensor, tier: torch.Tensor | None = None,
-                frame_valid: torch.Tensor | None = None):
+                frame_valid: torch.Tensor | None = None,
+                beats_feat: torch.Tensor | None = None):
         x = self.logmel(wav, frame_valid)           # (B, 1, F, T)
         x = self.mixstyle(x, tier)
         x = self.specaug(x)
         h = self.cnn(x)                            # (B, T', D)
 
         if self.beats is not None:
-            with torch.no_grad():
-                b = self.beats(wav)                # (B, Tb, 768)
-                # Frozen encoder: a non-finite value here can only poison the
-                # trainable branch, so neutralise it rather than propagate it.
-                b = torch.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0)
-            b = self.beats_proj(b.to(h.dtype))
+            # `beats_proj` is trainable and diverges between student and teacher,
+            # so what gets shared is the *raw* encoder output, never the
+            # projection.
+            if beats_feat is None:
+                beats_feat = self.encode_beats(wav)
+            b = self.beats_proj(beats_feat.to(h.dtype))
             h = torch.cat([h, align_time(b, h.size(1))], dim=-1)
 
         h = self.pre_rnn(h)

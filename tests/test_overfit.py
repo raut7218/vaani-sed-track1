@@ -8,7 +8,7 @@ from src.models.sed_model import VaaniSEDModel
 from src.postproc.csebbs import csebbs_single
 from src.evaluation.metrics import evaluate
 
-import soundfile as sf, json, pathlib, shutil
+import soundfile as sf, pathlib, shutil
 SR, CLIP, FPS = 16000, 4.0, 25.0
 TMP = pathlib.Path(__file__).resolve().parent / "_tmp_overfit"
 if TMP.exists(): shutil.rmtree(TMP)

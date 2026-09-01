@@ -25,7 +25,6 @@ def main() -> None:
     ap.add_argument("--run", required=True)
     ap.add_argument("--method", default="csebbs", choices=["csebbs", "median"])
     ap.add_argument("--rounds", type=int, default=2)
-    ap.add_argument("--collar-mode", default="pct", choices=["pct", "sed_eval"])
     args = ap.parse_args()
 
     run = Path(args.run)
@@ -43,11 +42,11 @@ def main() -> None:
                                               method="median",
                                               n_valid_frames=valid.get(u)))
                   for u in scores}
-    base = evaluate(base_preds, refs, collar_mode=args.collar_mode)
+    base = evaluate(base_preds, refs)
     print("[tune] median-filter baseline: %s" % json.dumps(base))
 
     params, report = tune(scores, refs, classes, fps, valid=valid, method=args.method,
-                          rounds=args.rounds, collar_mode=args.collar_mode)
+                          rounds=args.rounds)
 
     out = run / "postproc_params.json"
     out.write_text(json.dumps({"params": params, "union_gap": report.get("union_gap", 0.05),

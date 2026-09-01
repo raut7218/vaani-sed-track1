@@ -1,18 +1,29 @@
-"""Inference -> submission JSON.
+"""Inference -> the Codabench submission archive.
 
     python -m src.infer.predict --ckpt runs/baseline/best.pt \
-        --audio-dir data/test --out submission.json
+        --audio-dir data/test --out submission.zip
 
 Track 1 wants class-agnostic onset/offset pairs per clip, so per-class detections
 are unioned at the end. Long files are processed in overlapping windows and
 stitched, since the model is trained on a fixed window.
+
+The archive is exactly what the competition asks for: a ZIP holding a single
+`predictions.jsonl` at its root, one JSON object per clip:
+
+    {"clip_id": "vaani_eval_001", "events": [{"onset": 1.24, "offset": 3.81}]}
+
+Every evaluation clip must appear exactly once, with `[]` when nothing is
+detected - a missing line is not the same as an empty one, so `write_submission`
+emits a record for every input file even if decoding it failed.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+import zipfile
 from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -25,6 +36,44 @@ from src.models.sed_model import VaaniSEDModel
 from src.postproc.csebbs import decode_clip, default_params_for, union_events
 
 AUDIO_EXT = (".wav", ".flac", ".mp3", ".ogg", ".m4a")
+JSONL_NAME = "predictions.jsonl"          # the scorer looks for this exact name
+
+
+def write_submission(predictions: Dict[str, Sequence[Tuple[float, float]]],
+                     zip_path: str | Path) -> Path:
+    """Write `predictions.jsonl` and pack it at the root of `zip_path`.
+
+    Times are rounded to milliseconds and clamped to be non-negative and
+    non-decreasing. That is not cosmetic: the scorer rasterises onsets with
+    `int(onset / 0.01)`, so a negative onset would index a frame mask from the
+    wrong end, and an offset below its onset would silently contribute nothing.
+    """
+    zip_path = Path(zip_path)
+    if zip_path.suffix.lower() != ".zip":
+        zip_path = zip_path.with_suffix(".zip")
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_path = zip_path.with_name(JSONL_NAME)
+
+    n_events = 0
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for clip_id, events in predictions.items():
+            clean: List[dict] = []
+            for on, off in events:
+                on = max(0.0, round(float(on), 3))
+                off = max(on, round(float(off), 3))
+                clean.append({"onset": on, "offset": off})
+            n_events += len(clean)
+            f.write(json.dumps({"clip_id": str(clip_id), "events": clean},
+                               ensure_ascii=False) + "\n")
+
+    # arcname without a directory component: the scorer expects the file at the
+    # archive root, not nested inside a folder.
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(jsonl_path, JSONL_NAME)
+
+    print("[predict] wrote %s (%d clips, %d events) and %s"
+          % (jsonl_path, len(predictions), n_events, zip_path))
+    return zip_path
 
 
 def load_model(ckpt_path: str, device: torch.device, use_beats: bool | None = None):
@@ -99,11 +148,11 @@ def main() -> None:
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--audio-dir", default="", help="directory of test audio files")
     ap.add_argument("--manifest", default="", help="alternatively, a manifest.jsonl")
-    ap.add_argument("--out", default="submission.json")
+    ap.add_argument("--out", default="submission.zip",
+                    help="submission archive; predictions.jsonl is written beside it")
     ap.add_argument("--params", default="", help="tuned cSEBBs params json")
     ap.add_argument("--method", default="csebbs", choices=["csebbs", "median"])
     ap.add_argument("--union-gap", type=float, default=0.05)
-    ap.add_argument("--per-class-out", default="", help="also dump per-class events")
     ap.add_argument("--save-scores", default="", help="npz of raw frame scores")
     args = ap.parse_args()
 
@@ -139,31 +188,33 @@ def main() -> None:
         raise SystemExit("no audio found - pass --audio-dir or --manifest")
     print("[predict] %d files" % len(files))
 
-    submission, per_class_out, raw = {}, {}, {}
+    predictions, raw, n_failed = {}, {}, 0
     for i, (uid, path) in enumerate(files):
-        y, file_sr = sf.read(str(path), dtype="float32", always_2d=False)
-        if y.ndim > 1:
-            y = y.mean(axis=1)
-        if file_sr != sr:
-            import librosa
-            y = librosa.resample(y, orig_sr=file_sr, target_sr=sr)
-        scores = score_file(model, y, sr, clip_len, fps, device)
-        if args.save_scores:
-            raw[uid] = scores
-        per_cls = decode_clip(scores, le.classes, fps, params, method=args.method)
-        ev = union_events(per_cls, merge_gap_s=args.union_gap)
-        submission[uid] = [{"onset": round(a, 3), "offset": round(b, 3)} for a, b in ev]
-        per_class_out[uid] = {c: [{"onset": a, "offset": b} for a, b in v]
-                              for c, v in per_cls.items() if v}
+        try:
+            y, file_sr = sf.read(str(path), dtype="float32", always_2d=False)
+            if y.ndim > 1:
+                y = y.mean(axis=1)
+            if file_sr != sr:
+                import librosa
+                y = librosa.resample(y, orig_sr=file_sr, target_sr=sr)
+            scores = score_file(model, y, sr, clip_len, fps, device)
+            if args.save_scores:
+                raw[uid] = scores
+            per_cls = decode_clip(scores, le.classes, fps, params, method=args.method)
+            predictions[uid] = union_events(per_cls, merge_gap_s=args.union_gap)
+        except Exception as e:  # noqa: BLE001
+            # A clip that is missing from the submission is scored as if we
+            # predicted nothing anyway, but an exception here would abandon every
+            # clip after it. Record the empty result and keep going.
+            n_failed += 1
+            print("[predict] FAILED on %s (%s) - emitting no events" % (uid, e))
+            predictions[uid] = []
         if (i + 1) % 200 == 0:
             print("[predict] %d/%d" % (i + 1, len(files)))
 
-    Path(args.out).write_text(json.dumps(submission, indent=2), encoding="utf-8")
-    n_ev = sum(len(v) for v in submission.values())
-    print("[predict] wrote %s: %d clips, %d events" % (args.out, len(submission), n_ev))
-    if args.per_class_out:
-        Path(args.per_class_out).write_text(json.dumps(per_class_out, indent=2),
-                                            encoding="utf-8")
+    write_submission(predictions, args.out)
+    if n_failed:
+        print("[predict] WARNING: %d/%d clips failed to decode" % (n_failed, len(files)))
     if args.save_scores:
         np.savez_compressed(args.save_scores, **raw)
 

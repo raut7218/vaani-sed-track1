@@ -55,6 +55,8 @@ def run(device: str, dtype: torch.dtype) -> None:
         with torch.no_grad():
             t_out = teacher(batch["wav"], tier=None, frame_valid=batch["frame_valid"])
         loss, logs = compute_total_loss(s_out, t_out, batch, CFG, step=5)
+    # `logs` holds detached tensors so the training loop can stay sync-free.
+    logs = {k: float(v) for k, v in logs.items()}
 
     loss.backward()
     grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]

@@ -75,7 +75,14 @@ def sigmoid_rampup(step: int, length: int) -> float:
 
 
 def compute_total_loss(student_out, teacher_out, batch, cfg, step: int) -> tuple:
-    """Returns (loss, dict_of_scalars)."""
+    """Returns (loss, logs).
+
+    `logs` holds *detached GPU tensors*, not Python floats. Calling `float()` on
+    a live CUDA tensor forces a device synchronisation, and doing that three or
+    four times inside every training step drains the CUDA queue and serialises
+    the host against the device. The training loop accumulates these on-device
+    and reads them once per epoch instead.
+    """
     s_frame_logit, s_clip = student_out
     tier = batch["tier"]
     frame_t, clip_t = batch["frame_target"], batch["clip_target"]
@@ -87,7 +94,7 @@ def compute_total_loss(student_out, teacher_out, batch, cfg, step: int) -> tuple
     l_strong = masked_frame_bce(s_frame_logit, frame_t, frame_valid, w_strong)
     l_weak = masked_clip_bce(s_clip, clip_t, w_weak)
     loss = cfg["lambda_strong"] * l_strong + cfg["lambda_weak"] * l_weak
-    logs = {"loss_strong": float(l_strong.detach()), "loss_weak": float(l_weak.detach())}
+    logs = {"loss_strong": l_strong.detach(), "loss_weak": l_weak.detach()}
 
     if teacher_out is not None and cfg.get("lambda_cons", 0.0) > 0:
         t_frame_logit, t_clip = teacher_out
@@ -97,7 +104,7 @@ def compute_total_loss(student_out, teacher_out, batch, cfg, step: int) -> tuple
         c_clip = consistency_loss(s_clip, t_clip)
         l_cons = c_frame + c_clip
         loss = loss + cfg["lambda_cons"] * ramp * l_cons
-        logs.update({"loss_cons": float(l_cons.detach()), "cons_ramp": ramp})
+        logs.update({"loss_cons": l_cons.detach(), "cons_ramp": ramp})
 
-    logs["loss"] = float(loss.detach())
+    logs["loss"] = loss.detach()
     return loss, logs

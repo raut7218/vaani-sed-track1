@@ -3,33 +3,45 @@ import pathlib, sys, numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from src.postproc.csebbs import csebbs_single, median_filter_decode, union_events, default_params_for
-from src.evaluation.metrics import evaluate, segment_dice, match_events, _intersection
+from src.evaluation.metrics import evaluate, clip_dice, match_events
 from src.postproc.tune import tune
 
 FPS = 25.0
 ok = lambda c, m: print(("PASS " if c else "FAIL ") + m) or (0 if c else fails.append(m))
 fails = []
 
-# ---------- metrics ----------
-ok(abs(segment_dice([(0,1)], [(0,1)]) - 1.0) < 1e-9, "dice identical = 1")
-ok(abs(segment_dice([(0,1)], [(1,2)]) - 0.0) < 1e-9, "dice disjoint = 0")
-ok(abs(segment_dice([(0,2)], [(1,3)]) - 0.5) < 1e-9, "dice half overlap = 0.5")
-ok(abs(segment_dice([], []) - 1.0) < 1e-9, "dice empty/empty = 1")
-ok(abs(_intersection([(0,1),(2,3)], [(0.5,2.5)]) - 1.0) < 1e-9, "intersection multi-span")
+# ---------- metrics (must mirror the official Codabench scorer) ----------
+# Dice rasterises to 10 ms frames with an *inclusive* offset frame, so exact
+# values carry that one-frame widening - these are the scorer's numbers, not
+# the continuous-overlap ones.
+ok(abs(clip_dice([(0,1)], [(0,1)]) - 1.0) < 1e-9, "dice identical = 1")
+ok(abs(clip_dice([(0,1)], [(1,2)]) - 2/202) < 1e-9, "dice disjoint = only the shared edge frame")
+ok(abs(clip_dice([(0,2)], [(1,3)]) - 2*101/402) < 1e-9, "dice half overlap")
+ok(abs(clip_dice([], []) - 1.0) < 1e-9, "dice empty/empty = 1")
+ok(abs(clip_dice([(0,1)], []) - 0.0) < 1e-9, "dice pred-only = 0")
 
-# collar: ref 0..1 (dur 1) -> collar 0.2
-ok(match_events([(0.1,1.1)], [(0.0,1.0)], pct=0.2) == 1, "event within 20% collar matches")
-ok(match_events([(0.3,1.3)], [(0.0,1.0)], pct=0.2) == 0, "event outside collar rejected")
-# short event: ref 0..0.1 -> collar 0.02
-ok(match_events([(0.05,0.15)], [(0.0,0.1)], pct=0.2) == 0, "short event collar is tight")
-ok(match_events([(0.01,0.11)], [(0.0,0.1)], pct=0.2) == 1, "short event tight match ok")
+# match_events(ref, pred) -> (tp, fp, fn). Tolerance = max(0.2 * ref_dur, 0.05).
+tp = lambda ref, pred: match_events(ref, pred)[0]
+# ref 0..1 (dur 1) -> tol 0.2
+ok(tp([(0.0,1.0)], [(0.1,1.1)]) == 1, "event within 20% tolerance matches")
+ok(tp([(0.0,1.0)], [(0.3,1.3)]) == 0, "event outside tolerance rejected")
+# ref 0..0.1 (dur 0.1) -> 20% is 0.02, but the floor lifts it to 0.05
+ok(tp([(0.0,0.1)], [(0.05,0.15)]) == 1, "50 ms floor applies to short events")
+ok(tp([(0.0,0.1)], [(0.06,0.16)]) == 0, "beyond the 50 ms floor is rejected")
 # one prediction cannot satisfy two refs
-ok(match_events([(0.0,1.0)], [(0.0,1.0),(0.0,1.0)], pct=0.2) == 1, "1-to-1 matching enforced")
+ok(match_events([(0.0,1.0),(0.0,1.0)], [(0.0,1.0)]) == (1, 0, 1), "1-to-1 matching enforced")
+# closest-first: the exact prediction must claim the exact reference
+ok(match_events([(0.0,1.0),(0.1,1.1)], [(0.1,1.1),(0.0,1.0)]) == (2, 0, 0),
+   "greedy closest-first pairs both events")
 
 r = evaluate({"a": [(0.0,1.0)]}, {"a": [(0.0,1.0)]})
-ok(r["event_f1"] == 1.0 and r["segment_dice"] == 1.0 and r["score"] == 1.0, "perfect eval = 1.0")
+ok(r["event_f1"] == 1.0 and r["segment_dice"] == 1.0 and r["score"] == 2.0,
+   "perfect eval scores 2.0 (F1 + Dice, not their mean)")
 r = evaluate({"a": []}, {"a": [(0.0,1.0)]})
 ok(r["event_f1"] == 0.0 and r["recall"] == 0.0, "empty pred = 0 recall")
+# clips predicted but absent from the reference are pure false positives
+r = evaluate({"a": [(0.0,1.0)], "ghost": [(0.0,1.0)]}, {"a": [(0.0,1.0)]})
+ok(r["fp"] == 1 and r["event_f1"] < 1.0, "extra clip costs precision")
 
 # ---------- csebbs decoding ----------
 def curve(spans, n=250, hi=0.95, lo=0.05, noise=0.0, seed=0):
@@ -95,7 +107,7 @@ base = evaluate({u: union_events({"c0": csebbs_single(scores[u][:,0], FPS,
                  **default_params_for(classes)["c0"])}) for u in scores}, refs)
 print("   tuner: baseline score=%.4f -> tuned=%.4f" % (base["score"], rep["score"]))
 ok(rep["score"] >= base["score"], "tuning never degrades")
-ok(rep["score"] > 0.5, "tuner reaches a sane score on easy data (%.3f)" % rep["score"])
+ok(rep["score"] > 1.0, "tuner reaches a sane score on easy data (%.3f/2.0)" % rep["score"])
 
 print("\n%d failures" % len(fails))
 for f in fails: print("  -", f)

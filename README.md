@@ -3,6 +3,10 @@
 Sound event detection on Indic speech recordings: detect noise events and their
 onset/offset timestamps.
 
+**Competition:** [Datathon@IndoML 2026 — Track 1](https://www.codabench.org/competitions/17825/)
+on Codabench. Scored on **Event F1 + Segment Dice** (max 2.0) over an 11 h withheld
+test set; submit a ZIP holding one `predictions.jsonl`.
+
 **Architecture: frozen BEATs encoder + FDY-CRNN backbone, trained with mean-teacher
 semi-supervision on a per-tier masked loss, with frequency MixStyle for domain shift
 and cSEBBs for post-processing.**
@@ -39,8 +43,11 @@ python scripts/download_data.py --out data/vaani                  # full 154.6 h
 python -m src.train.train --config configs/default.yaml --data data/vaani --out runs/baseline
 python scripts/tune_postproc.py --run runs/baseline
 python -m src.infer.predict --ckpt runs/baseline/best.pt --audio-dir data/test \
-    --params runs/baseline/postproc_params.json --out submission.json
+    --params runs/baseline/postproc_params.json --out submission.zip
 ```
+
+Upload `submission.zip` to
+[Codabench competition 17825](https://www.codabench.org/competitions/17825/).
 
 ### Getting the data
 
@@ -70,7 +77,7 @@ to grow the training set gradually.
 Verify the whole pipeline first — synthetic audio, no download, no GPU, ~1 minute:
 
 ```bash
-python scripts/smoke_test.py     # end-to-end: train -> tune -> submission.json
+python scripts/smoke_test.py     # end-to-end: train -> tune -> submission.zip
 python tests/test_components.py  # 25 checks on metrics, cSEBBs decoding, tuner
 python tests/test_overfit.py     # proves frame targets are time-aligned
 python tests/test_amp_loss.py    # training step survives autocast (AMP)
@@ -160,23 +167,65 @@ which classes are present, you're only inferring where.
 
 ---
 
+## Training throughput (T4)
+
+A T4 is a **Turing GPU**, not a TPU: it has fp16 tensor cores but *no* bf16 and no TF32.
+fp16 autocast + `GradScaler` is therefore the right and only choice, and the log-mel
+front-end stays pinned to float32 (fp16's smallest subnormal sits above the `1e-10` clamp
+floor, so `log(0) = -inf` and the batch goes NaN — see `LogMel.forward`).
+
+The step used to be dominated by work that was not buying anything:
+
+| Fix | What it was doing | Where |
+|---|---|---|
+| **Share the BEATs pass** | The encoder is frozen and student and teacher see the identical waveform through *the same module object* — so it was computing two bit-identical tensors per step, for roughly a third of the wall clock. | `encode_beats` in [`sed_model.py`](src/models/sed_model.py) |
+| **`cudnn.benchmark = True`** | The window is a fixed size, so every step has identical tensor shapes. The autotuner pays for itself in the first few steps. | [`train.py`](src/train/train.py) |
+| **No per-step syncs** | The loss dict called `float()` on four live CUDA tensors *inside* every step, and `torch.isfinite(loss)` added a fifth. Each drains the CUDA queue. Logs are now accumulated on-device and read once per epoch. | [`losses.py`](src/train/losses.py) |
+| **Fused EMA** | The mean-teacher update walked `named_parameters()` and issued two kernel launches per tensor — a few hundred per step, which a 2-vCPU Colab host cannot feed. Now two `_foreach` calls against a pairing built once at startup. | `build_ema_pairs` |
+| **Teacher pinned to eval** | An `eval()`/`train()` round trip per step recursed through every submodule, BEATs' 12 transformer layers included. The teacher only ever runs in eval anyway. | `train.py` |
+| **Dataloader** | 4 workers (from 2) with prefetch, and the val loader keeps its workers alive instead of respawning them every epoch. | `configs/default.yaml` |
+
+Together these are worth roughly **2× end-to-end**, and none of them changes what the model
+learns — the loss, the sampling and the update rule are all bit-for-bit what they were.
+
+**Not yet done, in rough order of remaining value:** caching the frozen BEATs features to
+disk (removes the encoder from the training loop entirely, ~5 GB for the full corpus);
+trimming the 10 s window, which is ~39% zero padding at a 6.1 s corpus mean; `channels_last`
+for the conv stack; and moving `fdy_from_block` to 3 so the two largest-spatial blocks use
+plain convs. The last two change what the model learns and need an ablation before you
+trust them.
+
+Raising the batch size is **not** the lever it looks like. At batch 24 the step is
+compute-bound, so doubling the batch roughly doubles the step time at the same throughput;
+what it actually buys is amortising per-step overhead. The idle VRAM is mostly BEATs'
+`(B·heads, 496, 496)` relative-position-bias and attention matrices, which the feature cache
+above removes outright.
+
+---
+
 ## Metrics
 
-Track 1 ranks on two metrics, equally weighted:
+The competition publishes its scoring code, so
+[`src/evaluation/metrics.py`](src/evaluation/metrics.py) is a **faithful reimplementation
+of it** rather than an interpretation:
 
-* **Event-based F1** — correct when a prediction aligns within ±20% of event duration
-* **Segment Dice** — `2|P ∩ G| / (|P| + |G|)`
+| | |
+|---|---|
+| **Event-based F1** | Greedy closest-first 1-to-1 matching. A prediction matches when its onset *and* offset are both within `max(0.20 × ref_duration, 0.05)` s. Micro-averaged. |
+| **Segment Dice** | Events rasterised to a 10 ms grid with an inclusive offset frame; `2·|P ∩ G| / (|P| + |G|)`, **macro-averaged** across clips. Empty-vs-empty scores 1.0. |
+| **Combined** | `F1 + Dice`, maximum **2.0**. This is the leaderboard rank and the tuning objective. |
 
-Both are in [`src/evaluation/metrics.py`](src/evaluation/metrics.py), with
-`score = 0.5·F1 + 0.5·Dice` as the tuning objective.
+Three details that are easy to get wrong and each cost real score:
 
-The exact collar convention isn't fully pinned down on the challenge page, so both readings
-are implemented and switchable via `eval.collar_mode`:
+* **The tolerance floor is 50 ms, not zero.** Earlier revisions of this repo tuned against
+  a strict 20% collar, which is materially tighter for short events — a 0.1 s
+  `human_non_speech` event gets 50 ms of slack, not 20 ms.
+* **Dice is macro-averaged**, so a short clip counts as much as a long one. Optimising the
+  micro (duration-weighted) version quietly favours the long stationary classes.
+* **The score is a sum, not a mean.** A run scoring 1.42 is not 142%.
 
-* `pct` (default) — strict 20% of event duration
-* `sed_eval` — `max(0.2 s, 20%)`, the standard DCASE convention
-
-Tune with `pct`; it's the stricter, safer assumption.
+`tests/test_components.py` asserts these against hand-worked values, and the scorer's own
+published snippets were used as a differential reference while porting.
 
 ---
 
@@ -202,20 +251,31 @@ accuracy floor. It gets its own short cSEBBs filter window by default
 
 ## Submission format
 
-```json
-{
-  "clip_id_1": [{"onset": 1.24, "offset": 3.81}, {"onset": 4.31, "offset": 4.71}],
-  "clip_id_2": [{"onset": 0.05, "offset": 2.10}]
-}
+`predict.py` writes a **ZIP holding a single `predictions.jsonl` at its root** — exactly
+what Codabench expects. One JSON object per line, one line per clip:
+
+```jsonl
+{"clip_id": "vaani_eval_001", "events": [{"onset": 1.24, "offset": 3.81}, {"onset": 5.1, "offset": 6.55}]}
+{"clip_id": "vaani_eval_002", "events": []}
 ```
+
+Rules the writer enforces for you:
+
+* **Every evaluation clip appears exactly once**, with `[]` when nothing is detected — a
+  missing line is not the same as an empty one. If a clip fails to decode, `predict.py`
+  logs it and emits an empty record rather than aborting the run and losing the rest.
+* `predictions.jsonl` sits at the archive **root**, not inside a folder.
+* Times are milliseconds-rounded, non-negative, and non-decreasing. This is not cosmetic:
+  the scorer rasterises with `int(onset / 0.01)`, so a negative onset would index the frame
+  mask from the wrong end.
+* Clips you predict that are *not* in the evaluation set count their events as false
+  positives, so do not pad the file with extras.
 
 Track 1 is scored on class-agnostic boundaries, so per-class detections are unioned at the
 end. Training multi-class and unioning beats training a single "any noise" head — the class
-structure is what makes the frame representation learnable. Per-class detections are still
-available via `--per-class-out` for error analysis.
+structure is what makes the frame representation learnable.
 
-> Confirm the exact top-level container with the organisers before the final submission —
-> the challenge page shows the per-event objects but not the wrapper.
+`scripts/smoke_test.py` validates a real archive against every rule above.
 
 ---
 
@@ -237,7 +297,7 @@ src/train/losses.py          masked per-tier loss + consistency
 src/train/train.py           training loop
 src/postproc/csebbs.py       change-detection SEBBs
 src/evaluation/metrics.py    event F1 + segment Dice
-src/infer/predict.py         -> submission.json
+src/infer/predict.py         -> submission.zip (predictions.jsonl)
 third_party/beats/           BEATs source, vendored from microsoft/unilm (MIT)
 ```
 
@@ -252,9 +312,6 @@ Each is one flag:
 | `loss.lambda_cons: 0` | value of mean-teacher |
 | `model.mixstyle_p: 0` | value of frequency MixStyle |
 | `--method median` | cSEBBs vs frame thresholding |
-
-Use `evaluate_per_class` in `src/evaluation/metrics.py` — the aggregate score hides which
-categories a change actually moved.
 
 ## Credits
 

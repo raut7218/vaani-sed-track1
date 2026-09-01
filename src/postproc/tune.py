@@ -10,7 +10,7 @@ Cheap and worth it: this runs on cached validation scores, so no retraining.
 from __future__ import annotations
 
 import json
-from typing import Dict, List, Sequence
+from typing import Dict, Sequence
 
 import numpy as np
 
@@ -39,14 +39,14 @@ def _decode_all(scores: Dict[str, np.ndarray], valid: Dict[str, int],
 
 def tune(scores: Dict[str, np.ndarray], refs: Dict[str, list], classes: Sequence[str],
          fps: float, valid: Dict[str, int] | None = None, method: str = "csebbs",
-         rounds: int = 2, union_gap: float = 0.05, collar_mode: str = "pct",
+         rounds: int = 2, union_gap: float = 0.05,
          verbose: bool = True) -> tuple[Dict[str, dict], dict]:
     valid = valid or {}
     params = default_params_for(classes)
 
     def score_of(p: Dict[str, dict]) -> float:
         preds = _decode_all(scores, valid, classes, fps, p, method, union_gap)
-        return evaluate(preds, refs, collar_mode=collar_mode)["score"]
+        return evaluate(preds, refs)["score"]
 
     best = score_of(params)
     if verbose:
@@ -73,14 +73,14 @@ def tune(scores: Dict[str, np.ndarray], refs: Dict[str, list], classes: Sequence
     # A final sweep on the union merge gap, which is a global knob.
     for g in [0.0, 0.05, 0.1, 0.2]:
         preds = _decode_all(scores, valid, classes, fps, params, method, g)
-        s = evaluate(preds, refs, collar_mode=collar_mode)["score"]
+        s = evaluate(preds, refs)["score"]
         if s > best + 1e-6:
             best, union_gap = s, g
             if verbose:
                 print("[tune] union_gap=%s -> %.4f" % (g, best))
 
     preds = _decode_all(scores, valid, classes, fps, params, method, union_gap)
-    report = evaluate(preds, refs, collar_mode=collar_mode)
+    report = evaluate(preds, refs)
     report["union_gap"] = union_gap
     if verbose:
         print("[tune] final %s" % json.dumps(report))

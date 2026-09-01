@@ -6,7 +6,8 @@ __pycache__/
 /_smoke/
 *.pt
 *.npz
-submission.json
+submission.zip
+predictions.jsonl
 .ipynb_checkpoints/
 .DS_Store
 /data/**/*.wav
