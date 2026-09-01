@@ -23,13 +23,28 @@ class LogMel(nn.Module):
             sample_rate=sr, n_fft=n_fft, hop_length=hop, win_length=n_fft,
             f_min=fmin, f_max=fmax, n_mels=n_mels, power=2.0, center=True)
 
-    def forward(self, wav: torch.Tensor) -> torch.Tensor:
+    def forward(self, wav: torch.Tensor, valid: torch.Tensor | None = None) -> torch.Tensor:
         m = self.mel(wav)                              # (B, n_mels, T)
         m = torch.log(m.clamp(min=1e-10))
         # Per-clip normalisation: recording level varies hugely across Vaani
         # districts and devices, and absolute loudness is not the signal.
-        mu = m.mean(dim=(1, 2), keepdim=True)
-        sd = m.std(dim=(1, 2), keepdim=True).clamp(min=1e-5)
+        #
+        # Statistics are computed over *valid* frames only. Vaani clips are far
+        # shorter than the window (corpus mean ~6 s vs a 10 s window), so the
+        # padding fraction varies from clip to clip; normalising over the padded
+        # region would make every clip's scaling depend on its own length and
+        # leak that length into the features.
+        if valid is None:
+            mu = m.mean(dim=(1, 2), keepdim=True)
+            sd = m.std(dim=(1, 2), keepdim=True).clamp(min=1e-5)
+        else:
+            # `valid` arrives on the output frame grid; stretch it to mel frames.
+            w = torch.nn.functional.interpolate(
+                valid[:, None, :].to(m.dtype), size=m.size(-1), mode="nearest")
+            n = (w.sum(dim=(1, 2), keepdim=True) * m.size(1)).clamp(min=1.0)
+            mu = (m * w).sum(dim=(1, 2), keepdim=True) / n
+            var = ((m - mu) ** 2 * w).sum(dim=(1, 2), keepdim=True) / n
+            sd = var.sqrt().clamp(min=1e-5)
         return ((m - mu) / sd).unsqueeze(1)            # (B, 1, F, T)
 
 
@@ -88,7 +103,7 @@ class VaaniSEDModel(nn.Module):
 
     def forward(self, wav: torch.Tensor, tier: torch.Tensor | None = None,
                 frame_valid: torch.Tensor | None = None):
-        x = self.logmel(wav)                       # (B, 1, F, T)
+        x = self.logmel(wav, frame_valid)           # (B, 1, F, T)
         x = self.mixstyle(x, tier)
         x = self.specaug(x)
         h = self.cnn(x)                            # (B, T', D)
