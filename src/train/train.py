@@ -258,7 +258,15 @@ def main() -> None:
         torch.save({"model": student.state_dict(), "teacher": teacher.state_dict(),
                     "cfg": cfg, "classes": le.classes, "epoch": ep}, out_dir / "last.pt")
 
-    print("[train] best val score: %.4f  ->  %s" % (best, out_dir / "best.pt"))
+    if best < 0:
+        # No timestamped clips to validate against (e.g. a bronze-only batch of
+        # the corpus). Still emit best.pt so inference has something to load.
+        torch.save({"model": student.state_dict(), "cfg": cfg, "classes": le.classes,
+                    "which": "student", "epoch": epochs, "score": None},
+                   out_dir / "best.pt")
+        print("[train] no validation set - saved final student as best.pt")
+    else:
+        print("[train] best val score: %.4f  ->  %s" % (best, out_dir / "best.pt"))
 
 
 if __name__ == "__main__":
