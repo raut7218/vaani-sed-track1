@@ -13,6 +13,16 @@ domain shift.
 
 <p align="center"><a href="notebooks/Vaani_Track1_Colab.ipynb"><b>▶ Open the Colab notebook</b></a></p>
 
+> ### 📦 The dataset is still being uploaded
+> As of 2026-09-01 the HF repo publishes **9 clips (~0.006 h)** — a single parquet shard,
+> all from one district (ArunachalPradesh / Longding). The card describes a planned
+> ~167 h corpus and says data lands in batches.
+>
+> Everything here is built and verified against that real shard, and `prepare.py` is
+> **resumable** — rerun it as batches land and it skips what it already wrote. But don't
+> read anything into validation numbers until there is real data volume: with 9 clips the
+> metrics are noise, and the tier-balanced sampler has only one tier to draw from.
+
 ---
 
 ## Quick start (Colab)
