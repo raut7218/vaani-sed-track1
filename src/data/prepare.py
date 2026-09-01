@@ -59,6 +59,56 @@ def _resolve_tier(row: dict, has_ts: bool, gold_ids: set, default_ts_tier: str) 
     return default_ts_tier
 
 
+def build_record(row: dict, uid: str, duration: float, gold_ids: set,
+                 default_ts_tier: str, expand_vehicle: bool,
+                 unknown: Counter | None = None) -> dict:
+    """Turn one raw dataset row into a manifest record.
+
+    Shared by `prepare.py` (HF `load_dataset` path) and
+    `scripts/download_data.py` (direct parquet path) so the two cannot drift.
+    """
+    unknown = unknown if unknown is not None else Counter()
+    ts = row.get("NoiseSubCategoryTimeStamp") or []
+    tier = _resolve_tier(row, len(ts) > 0, gold_ids, default_ts_tier)
+
+    events = []
+    for ev in ts:
+        cls = resolve_event_class(ev.get("category", ""), ev.get("tag", ""), expand_vehicle)
+        if cls is None:
+            unknown[str(ev.get("category"))] += 1
+            continue
+        s, e = float(ev.get("start", 0.0)), float(ev.get("end", 0.0))
+        if e <= s:
+            continue
+        s = max(0.0, min(s, duration))
+        e = max(0.0, min(e, duration))
+        if e - s <= 0:
+            continue
+        events.append({"cls": cls, "start": round(s, 4), "end": round(e, 4),
+                       "tag": ev.get("tag", "")})
+
+    clip_labels = []
+    for c in (row.get("NoiseCategory") or []):
+        cc = canon_category(c)
+        if cc is None:
+            unknown[str(c)] += 1
+        else:
+            clip_labels.append(cc)
+    for ev in events:
+        b = ev["cls"]
+        clip_labels.append("vehicle_traffic" if b.startswith("vehicle_") else b)
+
+    if tier != "bronze" and not events:
+        tier = "bronze"  # timestamps existed but none survived validation
+
+    return {
+        "uid": uid, "duration": round(duration, 4), "tier": tier,
+        "state": row.get("state", ""), "district": row.get("district", ""),
+        "language": row.get("language", ""), "events": events,
+        "clip_labels": sorted(set(clip_labels)),
+    }
+
+
 def _uid(row: dict, i: int) -> str:
     a = row.get("audio")
     p = ""

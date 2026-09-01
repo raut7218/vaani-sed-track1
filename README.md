@@ -36,12 +36,30 @@ Or from a terminal:
 ```bash
 git clone https://github.com/raut7218/vaani-sed-track1.git && cd vaani-sed-track1
 pip install -r requirements.txt
-python -m src.data.prepare --out data/vaani --streaming
+python scripts/download_data.py --out data/vaani          # all shards, from HF
 python -m src.train.train --config configs/default.yaml --data data/vaani --out runs/baseline
 python scripts/tune_postproc.py --run runs/baseline
 python -m src.infer.predict --ckpt runs/baseline/best.pt --audio-dir data/test \
     --params runs/baseline/postproc_params.json --out submission.json
 ```
+
+### Getting the data
+
+`scripts/download_data.py` pulls **every** parquet shard from
+[the HF dataset](https://huggingface.co/datasets/PavanKumarJ-ARTPARK/Vaani_Noise_Event_TimeStamp)
+directly onto whatever machine you run it on (nothing is read from a local copy), decodes
+each clip and writes `manifest.jsonl`.
+
+```bash
+python scripts/download_data.py --out data/vaani --list-only   # what's on the server
+python scripts/download_data.py --out data/vaani --format flac # download + materialise
+```
+
+Both stages resume, so re-run it as new batches are published. It ends with a coverage
+line comparing what you got against the ~167 h the card advertises — if that gap is large,
+the data is not on the server yet, which no download flag can fix. `--format flac` is
+lossless and roughly half the size of wav; prefer it when writing to Google Drive.
+`src/data/prepare.py` is the older `datasets.load_dataset` equivalent and still works.
 
 Verify the whole pipeline first — synthetic audio, no download, no GPU, ~1 minute:
 
