@@ -13,15 +13,13 @@ domain shift.
 
 <p align="center"><a href="notebooks/Vaani_Track1_Colab.ipynb"><b>▶ Open the Colab notebook</b></a></p>
 
-> ### 📦 The dataset is still being uploaded
-> As of 2026-09-01 the HF repo publishes **9 clips (~0.006 h)** — a single parquet shard,
-> all from one district (ArunachalPradesh / Longding). The card describes a planned
-> ~167 h corpus and says data lands in batches.
+> ### 📦 Dataset: use the full corpus, not the sample
+> The training corpus is **[ARTPARK-IISc/Vaani-Noise-Event-Dataset](https://huggingface.co/datasets/ARTPARK-IISc/Vaani-Noise-Event-Dataset)**
+> — 182 shards, 16.5 GB, **90,637 clips / ~154.6 h**, and it is **gated** (accept the
+> terms, then supply a token; in Colab store it as the secret `HF_TOKEN`).
 >
-> Everything here is built and verified against that real shard, and `prepare.py` is
-> **resumable** — rerun it as batches land and it skips what it already wrote. But don't
-> read anything into validation numbers until there is real data volume: with 9 clips the
-> metrics are noise, and the tier-balanced sampler has only one tier to draw from.
+> `PavanKumarJ-ARTPARK/Vaani_Noise_Event_TimeStamp` is a 9-clip *sample* of it. Both work,
+> but only the full repo can train anything.
 
 ---
 
@@ -36,7 +34,8 @@ Or from a terminal:
 ```bash
 git clone https://github.com/raut7218/vaani-sed-track1.git && cd vaani-sed-track1
 pip install -r requirements.txt
-python scripts/download_data.py --out data/vaani          # all shards, from HF
+python scripts/download_data.py --out data/vaani --max-shards 2   # ~1000 clips
+python scripts/download_data.py --out data/vaani                  # full 154.6 h
 python -m src.train.train --config configs/default.yaml --data data/vaani --out runs/baseline
 python scripts/tune_postproc.py --run runs/baseline
 python -m src.infer.predict --ckpt runs/baseline/best.pt --audio-dir data/test \
@@ -45,21 +44,28 @@ python -m src.infer.predict --ckpt runs/baseline/best.pt --audio-dir data/test \
 
 ### Getting the data
 
-`scripts/download_data.py` pulls **every** parquet shard from
-[the HF dataset](https://huggingface.co/datasets/PavanKumarJ-ARTPARK/Vaani_Noise_Event_TimeStamp)
-directly onto whatever machine you run it on (nothing is read from a local copy), decodes
-each clip and writes `manifest.jsonl`.
+The corpus is gated. Accept the terms on the
+[dataset page](https://huggingface.co/datasets/ARTPARK-IISc/Vaani-Noise-Event-Dataset),
+create a read token, then expose it — in Colab as the secret `HF_TOKEN` (Secrets → enable
+notebook access), elsewhere as `export HF_TOKEN=hf_...`. `download_data.py` finds it
+automatically, in that order, falling back to a cached `huggingface-cli login`.
 
 ```bash
-python scripts/download_data.py --out data/vaani --list-only   # what's on the server
-python scripts/download_data.py --out data/vaani --format flac # download + materialise
+python scripts/download_data.py --out data/vaani --list-only    # what's on the server
+python scripts/download_data.py --out data/vaani --max-shards 2 # ~1000 clips, minutes
+python scripts/download_data.py --out data/vaani                # all 182 shards
 ```
 
-Both stages resume, so re-run it as new batches are published. It ends with a coverage
-line comparing what you got against the ~167 h the card advertises — if that gap is large,
-the data is not on the server yet, which no download flag can fix. `--format flac` is
-lossless and roughly half the size of wav; prefer it when writing to Google Drive.
-`src/data/prepare.py` is the older `datasets.load_dataset` equivalent and still works.
+| | |
+|---|---|
+| On the server | 182 shards, 16.5 GB parquet, 90,637 clips (~154.6 h) |
+| Decoded | ~9 GB as FLAC (default), ~17 GB as `--format wav` |
+| Peak disk | ≈ decoded size — each parquet blob is deleted once materialised (`--keep-parquet` to retain) |
+| Resumable | Yes, at clip granularity. Re-run after a disconnect. |
+
+~9 GB fits Colab's local disk comfortably but **not** a free 15 GB Drive, so keep the
+audio on local disk. `--max-shards` / `--shard-start` page through the corpus if you want
+to grow the training set gradually.
 
 Verify the whole pipeline first — synthetic audio, no download, no GPU, ~1 minute:
 
@@ -68,6 +74,7 @@ python scripts/smoke_test.py     # end-to-end: train -> tune -> submission.json
 python tests/test_components.py  # 25 checks on metrics, cSEBBs decoding, tuner
 python tests/test_overfit.py     # proves frame targets are time-aligned
 python tests/test_amp_loss.py    # training step survives autocast (AMP)
+python tests/test_schema.py      # annotationQuality + string timestamps
 ```
 
 `test_overfit.py` is the one that catches the nastiest class of bug: it drives frame BCE
@@ -111,37 +118,27 @@ Implemented in [`src/train/losses.py`](src/train/losses.py); tier quotas per bat
 
 ---
 
-## ⚠️ Tier assignment — the one open question
+## Tier assignment
 
-**The released parquet has no tier column.** The schema is `audio, imageFileName, state,
-district, duration, language, isTranscriptionAvailable, transcript, NoiseCategory,
-NoiseSubCategoryTimeStamp` — nothing distinguishing verified from unverified.
+The full corpus carries an **`annotationQuality`** column, so tiers come from the data
+rather than a guess. (The 9-clip sample had no such field, which is why earlier revisions
+of this README treated it as an open question.)
 
-`prepare.py` therefore resolves tiers like this:
+`prepare.py` resolves it case- and separator-insensitively, so `annotationQuality`,
+`annotation_quality` and `AnnotationQuality` all resolve, and maps generously —
+`gold`/`verified`/`tier1`/`high` → gold, and so on (`QUALITY_ALIASES` in
+[`src/data/prepare.py`](src/data/prepare.py)).
 
-* **bronze** — no `NoiseSubCategoryTimeStamp` entries. This *is* the bronze definition, so
-  it is exact.
-* **gold vs silver** — not derivable from the current schema. Timestamped clips default to
-  **silver**, the conservative choice (silver carries the lower strong-loss weight, so the
-  model doesn't over-trust boundaries that may be unverified).
+Two rules worth knowing:
 
-Three ways to fix this the moment better information exists, no code changes needed:
+* **Anything unmapped is reported, never guessed.** The download ends with the exact
+  values it saw and flags any it could not place, so you add them to `QUALITY_ALIASES`
+  and re-run — materialised clips are skipped, so that costs seconds.
+* **A gold/silver clip with no timestamps is demoted to bronze.** Without timestamps
+  there is nothing for the frame-level loss to consume, whatever the column claims.
 
-```bash
-# 1. organisers publish gold ids
-python -m src.data.prepare --out data/vaani --gold-ids gold_ids.txt
-
-# 2. you decide timestamped == gold
-python -m src.data.prepare --out data/vaani --default-ts-tier gold
-
-# 3. a tier column appears in the dataset -> picked up automatically
-#    (checks tier, quality, annotation_quality, verified, num_annotators, ...)
-```
-
-Since gold and silver differ *only* by `loss.strong_weight` in the config, you can also
-sweep that weight directly instead of guessing the split.
-
----
+Overrides remain available: `--gold-ids ids.txt`, or `--default-ts-tier gold` for the
+fallback when the column is missing entirely.
 
 ## Build order
 

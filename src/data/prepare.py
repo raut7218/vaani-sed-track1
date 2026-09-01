@@ -27,29 +27,104 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.data.labels import LabelEncoder, canon_category, resolve_event_class  # noqa: E402
 
-# Columns that, if the dataset ever adds them, tell us the tier directly.
-TIER_COLUMNS = ["tier", "quality", "annotation_quality", "split_tier", "label_quality"]
-VERIFIED_COLUMNS = ["verified", "is_verified", "agreement", "num_annotators", "n_annotators"]
+# Columns that carry the annotation tier. Matched case- and separator-insensitively,
+# so `annotationQuality`, `annotation_quality` and `AnnotationQuality` all hit.
+TIER_COLUMNS = ["annotationquality", "tier", "quality", "splittier", "labelquality",
+                "annotationtier"]
+VERIFIED_COLUMNS = ["verified", "isverified", "agreement", "numannotators", "nannotators"]
+
+# Observed / plausible spellings of the three tiers. The dataset is gated, so this
+# is deliberately generous; anything unmatched is reported rather than guessed.
+QUALITY_ALIASES = {
+    "gold": "gold", "goldstandard": "gold", "verified": "gold", "high": "gold",
+    "tier1": "tier1_gold", "1": "gold", "multiannotator": "gold",
+    "multipleannotator": "gold", "doubleannotated": "gold", "highquality": "gold",
+    "silver": "silver", "unverified": "silver", "medium": "silver", "2": "silver",
+    "singleannotator": "silver", "singleannotated": "silver", "mediumquality": "silver",
+    "bronze": "bronze", "weak": "bronze", "low": "bronze", "3": "bronze",
+    "tagonly": "bronze", "notimestamp": "bronze", "cliplevel": "bronze",
+    "lowquality": "bronze", "weaklabel": "bronze",
+}
+QUALITY_ALIASES["tier1"] = "gold"
+QUALITY_ALIASES["tier2"] = "silver"
+QUALITY_ALIASES["tier3"] = "bronze"
+
+# Values of the tier column that could not be mapped; surfaced at the end of a run.
+UNMAPPED_QUALITY: Counter = Counter()
+
+
+def _to_float(v) -> float | None:
+    """Parse a timestamp that may arrive as float, int or string."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        f = float(v)
+        return f if f == f else None            # reject NaN
+    s = str(v).strip().replace(",", ".")
+    if not s or s.lower() in ("na", "nan", "none", "null", "-"):
+        return None
+    try:
+        f = float(s)
+    except ValueError:
+        return None
+    return f if f == f else None
+
+
+def _norm_key(s: str) -> str:
+    return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+
+def _lookup(row: dict, names: list) -> tuple:
+    """Fetch a column by normalised name; returns (found, value)."""
+    norm = {_norm_key(k): k for k in row}
+    for n in names:
+        k = norm.get(n)
+        if k is not None:
+            return True, row[k]
+    return False, None
+
+
+def quality_to_tier(value) -> str | None:
+    """Map an annotationQuality value onto gold/silver/bronze, or None."""
+    if value is None:
+        return None
+    t = _norm_key(value)
+    if not t:
+        return None
+    if t in QUALITY_ALIASES:
+        return QUALITY_ALIASES[t]
+    for key, tier in QUALITY_ALIASES.items():       # substring fallback
+        if key in t:
+            return tier
+    return None
 
 
 def _resolve_tier(row: dict, has_ts: bool, gold_ids: set, default_ts_tier: str) -> str:
     """Assign gold / silver / bronze.
 
-    Priority: explicit tier column -> verification column -> gold-id list ->
-    configured default for timestamped clips. Clips with no timestamps are
-    always bronze (that *is* the definition of the bronze tier).
+    Priority: annotation-quality column -> verification column -> gold-id list ->
+    configured default. A clip with no usable timestamps is always bronze
+    regardless of what the quality column claims: bronze is defined by having no
+    timestamps, and the frame-level loss has nothing to consume without them.
     """
+    found, raw = _lookup(row, TIER_COLUMNS)
+    if found:
+        tier = quality_to_tier(raw)
+        if tier is not None:
+            # A gold/silver label without timestamps still cannot supply frame
+            # supervision, so it is demoted to bronze.
+            return tier if has_ts else "bronze"
+        if raw not in (None, ""):
+            UNMAPPED_QUALITY[str(raw)] += 1
+
     if not has_ts:
         return "bronze"
-    for c in TIER_COLUMNS:
-        v = row.get(c)
-        if isinstance(v, str) and v.strip().lower() in ("gold", "silver", "bronze"):
-            return v.strip().lower()
-    for c in VERIFIED_COLUMNS:
-        v = row.get(c)
+
+    found, v = _lookup(row, VERIFIED_COLUMNS)
+    if found:
         if isinstance(v, bool):
             return "gold" if v else "silver"
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
+        if isinstance(v, (int, float)):
             return "gold" if v >= 2 else "silver"
     if gold_ids:
         for key in ("uid", "id", "segment_id", "audio_id", "imageFileName"):
@@ -68,7 +143,7 @@ def build_record(row: dict, uid: str, duration: float, gold_ids: set,
     `scripts/download_data.py` (direct parquet path) so the two cannot drift.
     """
     unknown = unknown if unknown is not None else Counter()
-    ts = row.get("NoiseSubCategoryTimeStamp") or []
+    ts = _lookup(row, ["noisesubcategorytimestamp"])[1] or []
     tier = _resolve_tier(row, len(ts) > 0, gold_ids, default_ts_tier)
 
     events = []
@@ -77,7 +152,13 @@ def build_record(row: dict, uid: str, duration: float, gold_ids: set,
         if cls is None:
             unknown[str(ev.get("category"))] += 1
             continue
-        s, e = float(ev.get("start", 0.0)), float(ev.get("end", 0.0))
+        # In the full corpus `start`/`end` are typed as *string*, not float32 as
+        # in the earlier sample, so parse defensively: a bad value must skip one
+        # event, never abort a multi-hour download.
+        s, e = _to_float(ev.get("start")), _to_float(ev.get("end"))
+        if s is None or e is None:
+            unknown["<unparsable timestamp>"] += 1
+            continue
         if e <= s:
             continue
         s = max(0.0, min(s, duration))
