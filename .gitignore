@@ -10,3 +10,4 @@ submission.json
 .ipynb_checkpoints/
 .DS_Store
 /data/**/*.wav
+/tests/_tmp_overfit/

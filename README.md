@@ -36,8 +36,15 @@ python -m src.infer.predict --ckpt runs/baseline/best.pt --audio-dir data/test \
 Verify the whole pipeline first — synthetic audio, no download, no GPU, ~1 minute:
 
 ```bash
-python scripts/smoke_test.py
+python scripts/smoke_test.py     # end-to-end: train -> tune -> submission.json
+python tests/test_components.py  # 25 checks on metrics, cSEBBs decoding, tuner
+python tests/test_overfit.py     # proves frame targets are time-aligned
 ```
+
+`test_overfit.py` is the one that catches the nastiest class of bug: it drives frame BCE
+to ~2e-4 on a tiny gold set and confirms the decoded events land on the injected tones
+(F1 = 1.0). If you change the feature front-end, the CNN pooling, or the target builder,
+run it — a silent time-offset between audio and targets will not show up in the loss.
 
 ---
 
