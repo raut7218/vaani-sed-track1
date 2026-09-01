@@ -1,0 +1,68 @@
+seed: 42
+output_dir: runs/baseline
+
+data:
+  root: data/vaani            # produced by src/data/prepare.py
+  sr: 16000
+  n_mels: 128
+  hop: 160                    # 10 ms frames into the CNN
+  clip_len: 10.0              # window in seconds (pad/crop); corpus mean is ~6 s
+  fps: 25.0                   # output frame rate -> 40 ms resolution
+  val_frac: 0.10
+  expand_vehicle: true        # split vehicle_traffic into horn / engine
+  # `human_non_speech` events run 0.05-0.5 s. If it dominates your error budget,
+  # raise fps to 50 (20 ms frames) - costs ~1.7x memory in the RNN.
+
+model:
+  use_beats: true
+  beats_dir: checkpoints
+  beats_ckpt: ""              # auto-downloaded if empty
+  rnn_dim: 256
+  rnn_layers: 2
+  dropout: 0.2
+  n_basis: 4                  # FDY basis kernels; set 1 for a plain CRNN ablation
+  mixstyle_p: 0.5
+  mixstyle_alpha: 0.3
+  specaug: true
+
+train:
+  epochs: 30
+  batch_size: 24
+  lr: 0.001
+  weight_decay: 0.01
+  warmup_steps: 500
+  grad_clip: 5.0
+  ema_decay: 0.999            # mean-teacher decay
+  amp: true
+  num_workers: 2
+  eval_every: 1
+  # Every batch carries all three tiers so consistency and per-tier MixStyle
+  # always have something to work with.
+  tier_quotas:
+    gold: 0.4
+    silver: 0.4
+    bronze: 0.2
+
+loss:
+  lambda_strong: 1.0
+  lambda_weak: 0.5
+  lambda_cons: 2.0
+  cons_rampup_steps: 3000
+  # The masked per-tier weights. Bronze has no timestamps, so its strong weight
+  # must stay 0 - it trains the frame layer only through attention pooling.
+  strong_weight:
+    gold: 1.0
+    silver: 0.5
+    bronze: 0.0
+  weak_weight:
+    gold: 1.0
+    silver: 1.0
+    bronze: 1.0
+
+postproc:
+  method: csebbs              # csebbs | median
+  union_gap: 0.05
+  params_file: ""             # written by scripts/tune_postproc.py
+
+eval:
+  collar_mode: pct            # pct = strict 20% of duration | sed_eval = max(0.2s, 20%)

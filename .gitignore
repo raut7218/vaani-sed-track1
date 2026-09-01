@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+/data/
+/runs/
+/checkpoints/
+/_smoke/
+*.pt
+*.npz
+submission.json
+.ipynb_checkpoints/
+.DS_Store
+/data/**/*.wav
