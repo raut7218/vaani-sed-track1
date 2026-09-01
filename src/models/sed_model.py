@@ -24,8 +24,20 @@ class LogMel(nn.Module):
             f_min=fmin, f_max=fmax, n_mels=n_mels, power=2.0, center=True)
 
     def forward(self, wav: torch.Tensor, valid: torch.Tensor | None = None) -> torch.Tensor:
-        m = self.mel(wav)                              # (B, n_mels, T)
-        m = torch.log(m.clamp(min=1e-10))
+        # The whole front-end runs in float32 with autocast disabled.
+        #
+        # Under fp16 autocast this produced NaN from the first step: clips are
+        # zero-padded to the window length, so the padded region gives mel power
+        # of exactly 0, and the 1e-10 clamp floor is itself below the smallest
+        # fp16 subnormal (6e-8) - it rounds to 0.0 and stops guarding log().
+        # log(0) = -inf, and the per-clip mean/std then turn the whole batch NaN.
+        # (bf16 hides this: it has fp32's exponent range.)
+        with torch.autocast(device_type=wav.device.type, enabled=False):
+            m = self.mel(wav.float())                  # (B, n_mels, T)
+            m = torch.log(m.clamp(min=1e-10))
+            return self._normalise(m, valid)
+
+    def _normalise(self, m: torch.Tensor, valid: torch.Tensor | None) -> torch.Tensor:
         # Per-clip normalisation: recording level varies hugely across Vaani
         # districts and devices, and absolute loudness is not the signal.
         #
@@ -111,6 +123,9 @@ class VaaniSEDModel(nn.Module):
         if self.beats is not None:
             with torch.no_grad():
                 b = self.beats(wav)                # (B, Tb, 768)
+                # Frozen encoder: a non-finite value here can only poison the
+                # trainable branch, so neutralise it rather than propagate it.
+                b = torch.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0)
             b = self.beats_proj(b.to(h.dtype))
             h = torch.cat([h, align_time(b, h.size(1))], dim=-1)
 

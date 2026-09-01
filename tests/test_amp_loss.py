@@ -69,8 +69,51 @@ def run(device: str, dtype: torch.dtype) -> None:
         logs["loss_weak"], logs.get("loss_cons", float("nan"))))
 
 
+def front_end_fp16() -> None:
+    """The bug that bf16 could not catch.
+
+    Clips are zero-padded to the window, so the padded region has mel power of
+    exactly 0. The 1e-10 clamp floor is below the smallest fp16 subnormal (6e-8),
+    so under fp16 it rounds to 0.0, stops guarding log(), and the per-clip
+    mean/std turn the entire batch NaN. bf16 hides it (fp32 exponent range), so
+    this check runs the front-end in fp16 explicitly, on any device.
+    """
+    from src.models.sed_model import LogMel
+
+    # 1. Show *why* the front-end must be pinned to fp32: the clamp floor that
+    #    guards log() is not representable in fp16.
+    floor_fp16 = float(torch.tensor(1e-10, dtype=torch.float16))
+    assert floor_fp16 == 0.0, "expected 1e-10 to underflow in fp16"
+    print("  1e-10 clamp floor in fp16 -> %.1f (so log(0) = -inf; fp32 is required)"
+          % floor_fp16)
+
+    # 2. The front-end must stay fp32 and finite under autocast, on zero-padded
+    #    audio (every clip is padded to the window).
+    lm = LogMel()
+    wav = torch.cat([torch.randn(2, 16000) * 0.1, torch.zeros(2, 16000 * 3)], dim=1)
+    fv = torch.zeros(2, 100)
+    fv[:, :25] = 1.0                                   # 1 s valid of a 4 s window
+
+    devices = [("cpu", torch.bfloat16)]
+    if torch.cuda.is_available():
+        devices.append(("cuda", torch.float16))
+    for dev, dt in devices:
+        lm_d, wav_d, fv_d = lm.to(dev), wav.to(dev), fv.to(dev)
+        with torch.autocast(dev, dtype=dt):
+            x = lm_d(wav_d, fv_d)
+        assert x.dtype == torch.float32, \
+            "FAIL: front-end escaped to %s; it must stay fp32" % x.dtype
+        assert torch.isfinite(x).all(), \
+            "FAIL: non-finite front-end output under %s autocast" % dt
+        print("  %-4s autocast %-8s -> dtype=%s, finite, std=%.3f"
+              % (dev, str(dt).replace("torch.", ""), x.dtype, float(x.float().std())))
+    lm.cpu()
+
+
 def main() -> None:
-    print("autocast training-step regression:")
+    print("mixed-precision regressions:")
+    front_end_fp16()
+    print("autocast training-step:")
     run("cpu", torch.bfloat16)
     if torch.cuda.is_available():
         run("cuda", torch.float16)

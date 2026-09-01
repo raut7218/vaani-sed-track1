@@ -92,6 +92,8 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--no-beats", action="store_true")
+    ap.add_argument("--no-amp", action="store_true",
+                    help="disable mixed precision (use if you see non-finite loss)")
     args = ap.parse_args()
 
     cfg = load_cfg(args.config)
@@ -105,6 +107,8 @@ def main() -> None:
         cfg["train"]["batch_size"] = args.batch_size
     if args.no_beats:
         cfg["model"]["use_beats"] = False
+    if args.no_amp:
+        cfg["train"]["amp"] = False
 
     torch.manual_seed(cfg.get("seed", 42))
     np.random.seed(cfg.get("seed", 42))
@@ -192,6 +196,8 @@ def main() -> None:
     best = -1.0
     history = []
     gstep = 0
+    n_nonfinite = 0
+    nonfinite_limit = int(cfg['train'].get('nonfinite_limit', 50))
 
     for ep in range(1, epochs + 1):
         student.train()
@@ -213,6 +219,20 @@ def main() -> None:
                                         frame_valid=batch["frame_valid"])
                     teacher.train()
                 loss, logs = compute_total_loss(s_out, t_out, batch, loss_cfg, gstep)
+
+            # Fail fast on a persistently non-finite loss. GradScaler silently
+            # skips such steps, so without this the run burns every epoch
+            # updating nothing and reports NaN the whole way down.
+            if not torch.isfinite(loss):
+                n_nonfinite += 1
+                if n_nonfinite >= nonfinite_limit:
+                    raise RuntimeError(
+                        "loss has been non-finite for %d consecutive steps.\n"
+                        "Most likely a mixed-precision issue: rerun with --no-amp "
+                        "(or train.amp: false) to confirm.\n"
+                        "Last components: %s" % (n_nonfinite, logs))
+            else:
+                n_nonfinite = 0
 
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
