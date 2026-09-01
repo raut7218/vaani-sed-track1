@@ -217,6 +217,12 @@ class TierBatchSampler(Sampler):
             batch: List[int] = []
             for k, c in self.counts.items():
                 pool = pools[k]
+                if c > len(pool):
+                    # Tier smaller than its own quota (small/early dataset
+                    # batches): draw with replacement so the batch still has the
+                    # requested shape instead of silently shrinking.
+                    batch.extend(rng.choice(pool) for _ in range(c))
+                    continue
                 if ptr[k] + c > len(pool):  # wrap around, reshuffling
                     rng.shuffle(pool)
                     ptr[k] = 0

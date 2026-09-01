@@ -31,9 +31,18 @@ def masked_frame_bce(logits: torch.Tensor, target: torch.Tensor,
 
 def masked_clip_bce(probs: torch.Tensor, target: torch.Tensor,
                     sample_w: torch.Tensor) -> torch.Tensor:
-    """probs: (B, C) already in (0,1) from attention pooling."""
-    per = F.binary_cross_entropy(probs, target, reduction="none")               # (B,C)
-    w = sample_w[:, None].expand_as(per)
+    """probs: (B, C) already in (0,1) from attention pooling.
+
+    BCE is written out by hand in float32 rather than via
+    `F.binary_cross_entropy`, which torch refuses to run under autocast. We
+    cannot use the `_with_logits` form here either: attention pooling produces a
+    weighted *average of probabilities*, which has no corresponding logit before
+    the pooling step.
+    """
+    p = probs.float().clamp(1e-7, 1.0 - 1e-7)
+    t = target.float()
+    per = -(t * torch.log(p) + (1.0 - t) * torch.log1p(-p))                     # (B,C)
+    w = sample_w.float()[:, None].expand_as(per)
     return (per * w).sum() / w.sum().clamp(min=1.0)
 
 

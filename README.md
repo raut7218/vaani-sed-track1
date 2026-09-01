@@ -49,6 +49,7 @@ Verify the whole pipeline first — synthetic audio, no download, no GPU, ~1 min
 python scripts/smoke_test.py     # end-to-end: train -> tune -> submission.json
 python tests/test_components.py  # 25 checks on metrics, cSEBBs decoding, tuner
 python tests/test_overfit.py     # proves frame targets are time-aligned
+python tests/test_amp_loss.py    # training step survives autocast (AMP)
 ```
 
 `test_overfit.py` is the one that catches the nastiest class of bug: it drives frame BCE

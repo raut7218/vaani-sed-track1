@@ -127,7 +127,9 @@ class AttentionPool(nn.Module):
         a = self.att(h)
         if frame_valid is not None:
             a = a.masked_fill(frame_valid[..., None] < 0.5, torch.finfo(a.dtype).min)
-        a = torch.softmax(a, dim=1)
-        strong = torch.sigmoid(strong_logit)
+        # Pool in float32: under AMP the softmax-weighted average and the 1e-7
+        # clamp both underflow in fp16 (smallest normal half is ~6e-5).
+        a = torch.softmax(a.float(), dim=1)
+        strong = torch.sigmoid(strong_logit.float())
         clip = (strong * a).sum(dim=1).clamp(1e-7, 1 - 1e-7)
         return strong_logit, clip
