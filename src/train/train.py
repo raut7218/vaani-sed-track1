@@ -176,7 +176,15 @@ def main() -> None:
     epochs = int(cfg["train"]["epochs"])
     steps_per_epoch = max(1, len(sampler))
     total_steps = epochs * steps_per_epoch
-    warmup = int(cfg["train"].get("warmup_steps", min(500, total_steps // 10)))
+    # Cap warmup against the actual run length. A configured 500-step warmup on a
+    # run that only has 30 steps means the LR never leaves the ramp and the model
+    # trains at ~6e-5 instead of 1e-3 the whole way.
+    warmup = int(cfg["train"].get("warmup_steps", 500))
+    warmup_cap = max(1, total_steps // 10)
+    if warmup > warmup_cap:
+        print("[train] warmup %d steps > 10%% of the %d-step run; capping to %d"
+              % (warmup, total_steps, warmup_cap))
+        warmup = warmup_cap
 
     def lr_at(step: int) -> float:
         if step < warmup:
@@ -243,7 +251,11 @@ def main() -> None:
             scaler.step(opt)
             scaler.update()
             sched.step()
-            update_ema(student, teacher, ema_decay)
+            # Ramp the EMA decay in. At a fixed 0.999 the teacher needs ~3000
+            # steps to forget its random init, so on shorter runs it stays near
+            # noise and its predictions are meaningless. This is the standard
+            # mean-teacher warmup and is a no-op once the run is long enough.
+            update_ema(student, teacher, min(1.0 - 1.0 / (gstep + 1), ema_decay))
             gstep += 1
             nb += 1
             for k, v in logs.items():
