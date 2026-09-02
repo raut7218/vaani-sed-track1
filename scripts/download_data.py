@@ -44,12 +44,14 @@ that has been granted access.
   2. Create a token: https://huggingface.co/settings/tokens (read scope is enough).
   3. In Colab: Secrets (key icon in the left sidebar) -> add HF_TOKEN, and turn on
      "Notebook access" for it. This script picks it up automatically.
+     On Kaggle: Add-ons -> Secrets -> add HF_TOKEN, and attach it to the notebook.
+     This script picks that up automatically too.
      Elsewhere: export HF_TOKEN=hf_...   or pass --token hf_...
 """
 
 
 def resolve_token(explicit: str = "") -> str | None:
-    """Find an HF token: --token, then a Colab secret, then env, then hf CLI login."""
+    """Find an HF token: --token, then a Colab/Kaggle secret, then env, then hf CLI login."""
     if explicit:
         return explicit
     try:
@@ -59,6 +61,19 @@ def resolve_token(explicit: str = "") -> str | None:
                 v = userdata.get(key)
                 if v:
                     print("[auth] using Colab secret %s" % key)
+                    return v
+            except Exception:  # noqa: BLE001 - secret absent or access not granted
+                continue
+    except ImportError:
+        pass
+    try:
+        from kaggle_secrets import UserSecretsClient  # type: ignore
+        client = UserSecretsClient()
+        for key in ("HF_TOKEN", "HUGGINGFACE_TOKEN", "HUGGINGFACEHUB_API_TOKEN"):
+            try:
+                v = client.get_secret(key)
+                if v:
+                    print("[auth] using Kaggle secret %s" % key)
                     return v
             except Exception:  # noqa: BLE001 - secret absent or access not granted
                 continue

@@ -15,7 +15,17 @@ This is the configuration DCASE 2024 Task 4 converged on, and that challenge pos
 nearly the same problem: one model, multiple label qualities, missing labels, real
 domain shift.
 
-<p align="center"><a href="notebooks/Vaani_Track1_Colab.ipynb"><b>▶ Open the Colab notebook</b></a></p>
+<p align="center">
+<a href="notebooks/Vaani_Track1_Colab.ipynb"><b>▶ Open the Colab notebook</b></a>
+&nbsp;·&nbsp;
+<a href="notebooks/Vaani_Track1_MultiGPU.ipynb"><b>▶ Multi-GPU notebook (Kaggle 2x T4 / multi-GPU Colab)</b></a>
+</p>
+
+The multi-GPU notebook runs the same pipeline under `torchrun` + `DistributedDataParallel`
+so it scales across however many GPUs the session actually has (2 on Kaggle's `GPU T4 x2`
+accelerator). It has no Google Drive step - Kaggle doesn't offer one - so the dataset
+downloads fresh to local disk each session; see the notebook's intro cell for the Kaggle
+Dataset workaround if you want that to persist.
 
 > ### 📦 Dataset: use the full corpus, not the sample
 > The training corpus is **[ARTPARK-IISc/Vaani-Noise-Event-Dataset](https://huggingface.co/datasets/ARTPARK-IISc/Vaani-Noise-Event-Dataset)**
@@ -45,6 +55,19 @@ python scripts/tune_postproc.py --run runs/baseline
 python -m src.infer.predict --ckpt runs/baseline/best.pt --audio-dir data/test \
     --params runs/baseline/postproc_params.json --out submission.zip
 ```
+
+On a multi-GPU box (Kaggle's `GPU T4 x2`, or any single-node multi-GPU machine), launch
+training with `torchrun` instead of `python` to train under DistributedDataParallel —
+one process per GPU, gradients synced every step. `--batch-size` is **per GPU** (the
+standard DDP convention), so the effective global batch is `batch-size * nproc_per_node`:
+
+```bash
+torchrun --standalone --nproc_per_node=2 -m src.train.train \
+    --config configs/default.yaml --data data/vaani --out runs/baseline --batch-size 12
+```
+
+Everything else (`tune_postproc.py`, `predict.py`) stays single-process — there's no
+benefit to DDP for post-processing or inference.
 
 Upload `submission.zip` to
 [Codabench competition 17825](https://www.codabench.org/competitions/17825/).
