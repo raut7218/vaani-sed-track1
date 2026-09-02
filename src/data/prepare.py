@@ -93,9 +93,16 @@ def quality_to_tier(value) -> str | None:
         return None
     if t in QUALITY_ALIASES:
         return QUALITY_ALIASES[t]
-    for key, tier in QUALITY_ALIASES.items():       # substring fallback
+    # Substring fallback, longest key first. "verified" (-> gold) is itself a
+    # substring of "unverified" (-> silver), so the real dataset's
+    # "unverified_timestamps" would otherwise match "verified" first - in
+    # insertion order that key comes before "unverified" - and every
+    # unverified-timestamp clip would silently collapse into gold. Checking
+    # the most specific (longest) alias first means "unverified" wins over the
+    # "verified" it happens to contain, regardless of dict insertion order.
+    for key in sorted(QUALITY_ALIASES, key=len, reverse=True):
         if key in t:
-            return tier
+            return QUALITY_ALIASES[key]
     return None
 
 

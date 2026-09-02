@@ -56,7 +56,13 @@ for raw, want in [("gold", "gold"), ("Gold", "gold"), ("GOLD", "gold"),
                   ("silver", "silver"), ("Silver ", "silver"),
                   ("bronze", "bronze"), ("verified", "gold"), ("unverified", "silver"),
                   ("tier1", "gold"), ("tier2", "silver"), ("tier3", "bronze"),
-                  ("high", "gold"), ("low", "bronze")]:
+                  ("high", "gold"), ("low", "bronze"),
+                  # The real corpus's actual annotationQuality strings - "verified"
+                  # is a substring of "unverified", so a naive first-match substring
+                  # scan collapses every unverified_timestamps clip into gold. This
+                  # is the regression that shipped and needs to stay caught.
+                  ("verified_timestamps", "gold"), ("unverified_timestamps", "silver"),
+                  ("no_timestamps", "bronze")]:
     ok(quality_to_tier(raw) == want, "%-12r -> %s" % (raw, want))
 ok(quality_to_tier("wibble") is None, "unknown value -> None (reported, not guessed)")
 
