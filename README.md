@@ -70,9 +70,13 @@ python scripts/download_data.py --out data/vaani                # all 182 shards
 | Peak disk | ≈ decoded size — each parquet blob is deleted once materialised (`--keep-parquet` to retain) |
 | Resumable | Yes, at clip granularity. Re-run after a disconnect. |
 
-~9 GB fits Colab's local disk comfortably but **not** a free 15 GB Drive, so keep the
-audio on local disk. `--max-shards` / `--shard-start` page through the corpus if you want
-to grow the training set gradually.
+~9 GB fits Colab's local disk comfortably. In the Colab notebook, download into the local
+working copy and train against that — Google Drive is mounted over FUSE, and a shuffled
+`DataLoader` doing tens of thousands of small random reads against it is what causes a long
+stall before the first epoch prints anything. After downloading, `rsync` the local copy up
+to a Drive folder once so the *next* session restores it locally instead of re-downloading;
+the notebook's mount/download cells do exactly this. `--max-shards` / `--shard-start` page
+through the corpus if you want to grow the training set gradually.
 
 Verify the whole pipeline first — synthetic audio, no download, no GPU, ~1 minute:
 

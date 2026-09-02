@@ -150,6 +150,13 @@ def main() -> None:
     print("[train] device=%s" % device)
 
     root = Path(cfg["data"]["root"])
+    if "drive" in str(root.resolve()).lower() and "mydrive" in str(root.resolve()).lower():
+        print("[train] WARNING: data.root (%s) looks like a Google Drive mount. Random "
+              "small-file reads over Drive's FUSE layer during training are extremely slow - "
+              "this is the classic 'nothing happens for 20 minutes' stall before the first "
+              "epoch prints anything. Copy the dataset to local disk first, e.g.:\n"
+              "    rsync -a '%s/' /content/work/data/\n"
+              "and point --data at that local copy instead." % (root, root))
     recs = read_manifest(root / "manifest.jsonl")
     tr_recs, va_recs = split_manifest(recs, val_frac=cfg["data"]["val_frac"],
                                       seed=cfg.get("seed", 42))
